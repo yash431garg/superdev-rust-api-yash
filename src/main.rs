@@ -17,6 +17,7 @@ use spl_token::instruction::{initialize_mint, mint_to};
 use std::{net::SocketAddr, str::FromStr};
 use std::{convert::TryFrom};
 use solana_sdk::system_instruction;
+use spl_token::instruction::transfer;
 
 
 #[derive(Serialize)]
@@ -243,34 +244,39 @@ struct SignMessageResponseData {
     message: String,
 }
 
+
 async fn sign_message_handler(raw_body: Bytes) -> impl IntoResponse {
-    
+    // Deserialize JSON and handle errors
     let payload: SignMessageRequest = match serde_json::from_slice(&raw_body) {
         Ok(p) => p,
-        Err(e) => {
-            return ApiResponse::Error(format!("Missing required fields or invalid JSON: {}", e));
+        Err(_) => {
+            return ApiResponse::Error("Missing required fields".to_string());
         }
     };
 
-    
+    // Check that required fields are not empty
+    if payload.message.trim().is_empty() || payload.secret.trim().is_empty() {
+        return ApiResponse::Error("Missing required fields".to_string());
+    }
+
+    // Decode secret key from base58
     let secret_bytes = match bs58::decode(&payload.secret).into_vec() {
         Ok(bytes) => bytes,
         Err(_) => return ApiResponse::Error("Invalid base58 secret key".to_string()),
     };
 
-    
+    // Reconstruct keypair from bytes
     let keypair = match Keypair::from_bytes(&secret_bytes) {
         Ok(kp) => kp,
         Err(_) => return ApiResponse::Error("Invalid secret key bytes".to_string()),
     };
 
-    
+    // Sign the message bytes
     let message_bytes = payload.message.as_bytes();
     let signature: Signature = keypair.sign_message(message_bytes);
 
-    
+    // Encode signature as base64
     let signature_base64 = base64::encode(signature.as_ref());
-
 
     let response_data = SignMessageResponseData {
         signature: signature_base64,
@@ -280,7 +286,6 @@ async fn sign_message_handler(raw_body: Bytes) -> impl IntoResponse {
 
     ApiResponse::Success(response_data)
 }
-
 
 
 #[derive(Deserialize)]
@@ -382,7 +387,7 @@ async fn send_sol_handler(raw_body: Bytes) -> impl IntoResponse {
         Err(_) => return ApiResponse::Error("Invalid 'to' public key".to_string()),
     };
 
-    // Create transfer instruction
+
     let instruction: Instruction = system_instruction::transfer(&from_pubkey, &to_pubkey, payload.lamports);
 
 
@@ -392,7 +397,7 @@ async fn send_sol_handler(raw_body: Bytes) -> impl IntoResponse {
         .map(|meta| meta.pubkey.to_string())
         .collect::<Vec<_>>();
 
-    // Base64 encode instruction data
+
     let instruction_data = base64::encode(&instruction.data);
 
     let response_data = SendSolResponseData {
@@ -404,6 +409,91 @@ async fn send_sol_handler(raw_body: Bytes) -> impl IntoResponse {
     ApiResponse::Success(response_data)
 }
 
+#[derive(Deserialize)]
+struct SendTokenRequest {
+    destination: String,
+    mint: String,
+    owner: String,
+    amount: u64,
+}
+
+#[derive(Serialize)]
+struct SendTokenAccountResponse {
+    pubkey: String,
+    isSigner: bool,
+}
+
+#[derive(Serialize)]
+struct SendTokenResponseData {
+    program_id: String,
+    accounts: Vec<SendTokenAccountResponse>,
+    instruction_data: String,
+}
+
+async fn send_token_handler(raw_body: Bytes) -> impl IntoResponse {
+    // Deserialize JSON manually
+    let payload: SendTokenRequest = match serde_json::from_slice(&raw_body) {
+        Ok(p) => p,
+        Err(e) => {
+            return ApiResponse::Error(format!("Invalid JSON or missing required fields: {}", e));
+        }
+    };
+
+    // Validate amount > 0
+    if payload.amount == 0 {
+        return ApiResponse::Error("Amount must be greater than zero".to_string());
+    }
+
+    // Parse pubkeys
+    let destination = match Pubkey::from_str(&payload.destination) {
+        Ok(pk) => pk,
+        Err(_) => return ApiResponse::Error("Invalid destination pubkey".to_string()),
+    };
+
+    let mint = match Pubkey::from_str(&payload.mint) {
+        Ok(pk) => pk,
+        Err(_) => return ApiResponse::Error("Invalid mint pubkey".to_string()),
+    };
+
+    let owner = match Pubkey::from_str(&payload.owner) {
+        Ok(pk) => pk,
+        Err(_) => return ApiResponse::Error("Invalid owner pubkey".to_string()),
+    };
+
+    // Create SPL token transfer instruction
+    let instruction = match transfer(
+        &spl_token::id(),
+        &destination,
+        &mint,
+        &owner,
+        &[], // no multisig signers
+        payload.amount,
+    ) {
+        Ok(ix) => ix,
+        Err(e) => return ApiResponse::Error(format!("Failed to create transfer instruction: {}", e)),
+    };
+
+    // Map accounts to response format (pubkey + isSigner)
+    let accounts = instruction
+        .accounts
+        .iter()
+        .map(|meta| SendTokenAccountResponse {
+            pubkey: meta.pubkey.to_string(),
+            isSigner: meta.is_signer,
+        })
+        .collect::<Vec<_>>();
+
+    // Base64 encode instruction data
+    let instruction_data = base64::encode(&instruction.data);
+
+    let response_data = SendTokenResponseData {
+        program_id: instruction.program_id.to_string(),
+        accounts,
+        instruction_data,
+    };
+
+    ApiResponse::Success(response_data)
+}
 #[tokio::main]
 async fn main() {
     let app = Router::new()
@@ -412,7 +502,8 @@ async fn main() {
         .route("/token/mint", post(mint_token_handler))
         .route("/message/sign", post(sign_message_handler))
         .route("/message/verify", post(verify_message_handler))
-        .route("/send/sol", post(send_sol_handler));
+        .route("/send/sol", post(send_sol_handler))
+         .route("/send/token", post(send_token_handler));
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
     println!("Server is running on {}", addr);
