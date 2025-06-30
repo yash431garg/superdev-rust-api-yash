@@ -16,6 +16,8 @@ use solana_sdk::{
 use spl_token::instruction::{initialize_mint, mint_to};
 use std::{net::SocketAddr, str::FromStr};
 use std::{convert::TryFrom};
+use solana_sdk::system_instruction;
+
 
 #[derive(Serialize)]
 struct SuccessResponse<T> {
@@ -295,7 +297,6 @@ struct VerifyMessageResponseData {
     pubkey: String,
 }
 async fn verify_message_handler(raw_body: Bytes) -> impl IntoResponse {
-    // Deserialize JSON manually to catch errors
     let payload: VerifyMessageRequest = match serde_json::from_slice(&raw_body) {
         Ok(p) => p,
         Err(e) => {
@@ -303,13 +304,11 @@ async fn verify_message_handler(raw_body: Bytes) -> impl IntoResponse {
         }
     };
 
-    // Decode signature from base64
     let signature_bytes_vec = match base64::decode(&payload.signature) {
         Ok(bytes) => bytes,
         Err(_) => return ApiResponse::Error("Invalid base64 signature".to_string()),
     };
 
-    // Check length and convert Vec<u8> to [u8; 64]
     if signature_bytes_vec.len() != 64 {
         return ApiResponse::Error(format!(
             "Signature has incorrect length: expected 64, got {}",
@@ -321,19 +320,16 @@ async fn verify_message_handler(raw_body: Bytes) -> impl IntoResponse {
         Err(_) => return ApiResponse::Error("Failed to convert signature bytes".to_string()),
     };
 
-    // Construct Signature from bytes
     let signature = match Signature::try_from(signature_bytes) {
         Ok(sig) => sig,
         Err(_) => return ApiResponse::Error("Invalid signature bytes".to_string()),
     };
 
-    // Parse public key from base58
     let pubkey = match Pubkey::from_str(&payload.pubkey) {
         Ok(pk) => pk,
         Err(_) => return ApiResponse::Error("Invalid base58 pubkey".to_string()),
     };
 
-    // Verify the signature
     let valid = signature.verify(pubkey.as_ref(), payload.message.as_bytes());
 
     let response_data = VerifyMessageResponseData {
@@ -346,6 +342,68 @@ async fn verify_message_handler(raw_body: Bytes) -> impl IntoResponse {
 }
 
 
+#[derive(Deserialize)]
+struct SendSolRequest {
+    from: String,
+    to: String,
+    lamports: u64,
+}
+
+#[derive(Serialize)]
+struct SendSolResponseData {
+    program_id: String,
+    accounts: Vec<String>,
+    instruction_data: String,
+}
+
+async fn send_sol_handler(raw_body: Bytes) -> impl IntoResponse {
+
+    let payload: SendSolRequest = match serde_json::from_slice(&raw_body) {
+        Ok(p) => p,
+        Err(e) => {
+            return ApiResponse::Error(format!("Invalid JSON or missing required fields: {}", e));
+        }
+    };
+
+
+    if payload.lamports == 0 {
+        return ApiResponse::Error("Lamports must be greater than zero".to_string());
+    }
+
+
+    let from_pubkey = match Pubkey::from_str(&payload.from) {
+        Ok(pk) => pk,
+        Err(_) => return ApiResponse::Error("Invalid 'from' public key".to_string()),
+    };
+
+
+    let to_pubkey = match Pubkey::from_str(&payload.to) {
+        Ok(pk) => pk,
+        Err(_) => return ApiResponse::Error("Invalid 'to' public key".to_string()),
+    };
+
+    // Create transfer instruction
+    let instruction: Instruction = system_instruction::transfer(&from_pubkey, &to_pubkey, payload.lamports);
+
+
+    let accounts = instruction
+        .accounts
+        .iter()
+        .map(|meta| meta.pubkey.to_string())
+        .collect::<Vec<_>>();
+
+    // Base64 encode instruction data
+    let instruction_data = base64::encode(&instruction.data);
+
+    let response_data = SendSolResponseData {
+        program_id: instruction.program_id.to_string(),
+        accounts,
+        instruction_data,
+    };
+
+    ApiResponse::Success(response_data)
+}
+
 #[tokio::main]
 async fn main() {
     let app = Router::new()
@@ -353,7 +411,8 @@ async fn main() {
         .route("/token/create", post(create_token_handler))
         .route("/token/mint", post(mint_token_handler))
         .route("/message/sign", post(sign_message_handler))
-        .route("/message/verify", post(verify_message_handler));
+        .route("/message/verify", post(verify_message_handler))
+        .route("/send/sol", post(send_sol_handler));
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
     println!("Server is running on {}", addr);
